@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Secrets / local state — a Telegram session file grants full account access.
+*.session
+*.session-journal
+config.json
+.env
+index.sqlite3*
+*.tgfs-part
+
+# Session auditor output (reports, worktrees, logs)
+.claude/audits/

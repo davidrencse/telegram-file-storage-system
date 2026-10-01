@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --frozen --group dev
+      - run: uv run --frozen ruff check src tests session_auditor
+      - run: uv run --frozen ruff format --check src tests session_auditor
+
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+        suite:
+          - name: tgfs
+            args: tests/test_storage.py tests/test_fusefs.py tests/test_web.py tests/test_cli.py tests/test_system.py
+          - name: auditor-unit
+            args: tests/session_auditor -m "not e2e and not live"
+          - name: auditor-e2e
+            args: tests/session_auditor -m e2e
+    name: test (${{ matrix.suite.name }}, py${{ matrix.python }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev
+      - run: uv sync --frozen --all-extras --group dev
+      - run: git config --global user.name ci && git config --global user.email ci@localhost
+      - run: uv run --frozen pytest -q ${{ matrix.suite.args }}
+
+  hook-smoke:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: hook command from .claude/settings.json works with bare system python
+        run: |
+          SMOKE=$(mktemp -d); git -C "$SMOKE" init -q; echo x > "$SMOKE/a"
+          CMD=$(python3 -c 'import json;print(json.load(open(".claude/settings.json"))["hooks"]["SessionStart"][0]["hooks"][0]["command"])')
+          echo "{\"hook_event_name\":\"SessionStart\",\"session_id\":\"ci\",\"cwd\":\"$SMOKE\"}" | CLAUDE_PROJECT_DIR="$PWD" bash -c "$CMD"
+          test -s "$SMOKE/.claude/audits/ci/session.json"

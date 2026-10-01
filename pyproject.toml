@@ -1,0 +1,54 @@
+[project]
+name = "tgfs"
+version = "0.1.0"
+description = "Use your Telegram account as a file storage backend (CLI + FUSE mount)"
+readme = "README.md"
+authors = [
+    { name = "David Ren", email = "d.david.ren.r@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "cryptography>=50.0.2",
+    "rich>=15.0.0",
+    "starlette>=1.7.0",
+    "telethon>=1.45.0",
+    "typer>=0.27.2",
+    "uvicorn>=0.54.0",
+]
+
+[project.optional-dependencies]
+fuse = [
+    "mfusepy>=3.1.1",
+]
+fast = [
+    "cryptg>=0.6.0",
+]
+
+[project.scripts]
+tgfs = "tgfs.cli:main"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "e2e: end-to-end auditor pipeline tests (real git, subprocess agent)",
+    "live: calls the real `claude` CLI; costs money; opt in with AUDITOR_LIVE=1",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.20,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.9",
+]

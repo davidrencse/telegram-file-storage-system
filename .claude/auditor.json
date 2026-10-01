@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "agent": "claude",
+  "model": "opus",
+  "effort": "high",
+  "max_budget_usd": 5.0,
+  "timeout_s": 2400,
+  "audit_readonly_sessions": false,
+  "keep_worktree": false
+}
