@@ -3,14 +3,17 @@ the backend, and record everything in the index."""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import os
 import secrets
-from collections.abc import Callable
+from collections import deque
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 from .backend import Backend
-from .config import DEFAULT_CHUNK_SIZE
+from .config import DEFAULT_CHUNK_SIZE, DEFAULT_PARALLEL
 from .crypto import SALT_SIZE, Cipher, new_salt
 from .errors import IntegrityError, InvalidOperation, IsADirectory, NotFound, PassphraseRequired
 from .index import Chunk, Index, Node, join_path, split_path
@@ -48,18 +51,24 @@ class Storage:
         backend: Backend,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         cipher: Cipher | None = None,
+        parallel: int = DEFAULT_PARALLEL,
     ) -> None:
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
+        if parallel <= 0:
+            raise ValueError("parallel must be positive")
         self.index = index
         self.backend = backend
         self.chunk_size = chunk_size
         self.cipher = cipher
+        # Chunks in flight per file. Peak memory ~ (parallel + 1) * chunk_size.
+        self.parallel = parallel
 
     # ---- chunk I/O ----------------------------------------------------------
 
     async def _upload_chunk(self, idx: int, data: bytes) -> Chunk:
-        blob = self.cipher.encrypt(data) if self.cipher else data
+        # AES-GCM over a 64 MiB chunk takes a while: keep the event loop (FUSE, web UI) responsive.
+        blob = await asyncio.to_thread(self.cipher.encrypt, data) if self.cipher else data
         # Random blob name: never leak real file names into the chat.
         mid = await self.backend.upload(blob, f"{secrets.token_hex(8)}.bin")
         return Chunk(idx=idx, message_id=mid, size=len(data), encrypted=self.cipher is not None)
@@ -69,7 +78,7 @@ class Storage:
         if chunk.encrypted:
             if self.cipher is None:
                 raise PassphraseRequired("file is encrypted; set TGFS_PASSPHRASE")
-            blob = self.cipher.decrypt(blob)
+            blob = await asyncio.to_thread(self.cipher.decrypt, blob)
         if len(blob) != chunk.size:
             raise IntegrityError(f"chunk {chunk.message_id}: expected {chunk.size} bytes, got {len(blob)}")
         return blob
@@ -120,21 +129,46 @@ class Storage:
         digest = hashlib.sha256()
         size = 0
         chunks: list[Chunk] = []
+        pending: set[asyncio.Task[Chunk]] = set()
         try:
             with local.open("rb") as f:
+                idx = 0
                 while data := f.read(self.chunk_size):
                     digest.update(data)
                     size += len(data)
-                    chunks.append(await self._upload_chunk(len(chunks), data))
-                    if progress:
-                        progress(len(data))
+                    while len(pending) >= self.parallel:
+                        await self._reap(pending, chunks, progress)
+                    pending.add(asyncio.create_task(self._upload_chunk(idx, data)))
+                    idx += 1
+            while pending:
+                await self._reap(pending, chunks, progress)
+            chunks.sort(key=lambda c: c.idx)
             node, orphaned = self.index.put_file(target, size, digest.hexdigest(), chunks, mtime=local.stat().st_mtime)
         except BaseException:
-            # Never leave unreferenced blobs behind in the chat.
+            # Never leave unreferenced blobs behind in the chat. In-flight uploads are awaited, not
+            # cancelled: a cancelled send may still land in the chat and we would lose its id.
+            results = await asyncio.gather(*pending, return_exceptions=True)
+            chunks.extend(r for r in results if isinstance(r, Chunk))
             await self._delete_messages([c.message_id for c in chunks])
             raise
         await self._delete_messages(orphaned)
         return node
+
+    @staticmethod
+    async def _reap(pending: set[asyncio.Task[Chunk]], chunks: list[Chunk], progress: Progress | None) -> None:
+        """Wait for at least one upload; record every finished chunk before re-raising any failure."""
+        done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        error: BaseException | None = None
+        for task in done:
+            pending.discard(task)
+            if (exc := task.exception()) is not None:
+                error = error or exc
+                continue
+            chunks.append(task.result())
+            if progress:
+                progress(task.result().size)
+        if error is not None:
+            raise error
 
     async def put_tree(self, local_dir: Path | str, remote_dir: str, progress: Progress | None = None) -> int:
         """Upload a directory recursively into remote_dir/<local_dir.name>. Returns file count."""
@@ -168,12 +202,12 @@ class Storage:
         digest = hashlib.sha256()
         try:
             with part.open("wb") as f:
-                for chunk in self.index.chunks(node.id):
-                    data = await self.read_chunk(chunk)
-                    digest.update(data)
-                    f.write(data)
-                    if progress:
-                        progress(len(data))
+                async with contextlib.aclosing(self.iter_chunks(node)) as stream:
+                    async for data in stream:
+                        digest.update(data)
+                        f.write(data)
+                        if progress:
+                            progress(len(data))
             if node.sha256 and digest.hexdigest() != node.sha256:
                 raise IntegrityError(f"{remote}: checksum mismatch")
             os.utime(part, (node.mtime, node.mtime))
@@ -182,6 +216,25 @@ class Storage:
             part.unlink(missing_ok=True)
             raise
         return local
+
+    async def iter_chunks(self, node: Node) -> AsyncIterator[bytes]:
+        """Yield a file's plaintext chunks in order, prefetching up to `parallel` ahead."""
+        todo = iter(self.index.chunks(node.id))
+        window: deque[asyncio.Task[bytes]] = deque()
+        try:
+            for chunk in todo:
+                window.append(asyncio.create_task(self.read_chunk(chunk)))
+                if len(window) >= self.parallel:
+                    break
+            while window:
+                data = await window.popleft()
+                if (nxt := next(todo, None)) is not None:
+                    window.append(asyncio.create_task(self.read_chunk(nxt)))
+                yield data
+        finally:
+            for task in window:
+                task.cancel()
+            await asyncio.gather(*window, return_exceptions=True)
 
     async def get_tree(self, remote_dir: str, local_dir: Path | str, progress: Progress | None = None) -> int:
         node = self.index.require_dir(remote_dir)
@@ -219,8 +272,11 @@ class Storage:
             await self.backend.delete([previous])
         return mid
 
-    async def restore_index(self, passphrase: str | None = None) -> int:
-        """Replace the local index with the newest snapshot from the chat."""
+    async def restore_index(self, passphrase: str | None = None, require_encrypted: bool = False) -> int:
+        """Replace the local index with the newest snapshot from the chat.
+
+        `require_encrypted` refuses a plaintext snapshot: someone with write access to the chat could
+        otherwise plant one and silently switch an encrypted setup to attacker-chosen metadata."""
         mid = await self.backend.find_latest(INDEX_CAPTION)
         if mid is None:
             raise NotFound("no index backup found in chat")
@@ -236,6 +292,10 @@ class Storage:
             data = cipher.decrypt(payload)
             self.index.restore(data)
             self.cipher = cipher
-        else:
+        elif body[:1] == b"\x00":
+            if require_encrypted:
+                raise IntegrityError("index backup is not encrypted but encryption is enabled; refusing")
             self.index.restore(body[1:])
+        else:
+            raise IntegrityError("index backup has unknown format")
         return mid

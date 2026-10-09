@@ -384,7 +384,7 @@ def restore(force: Annotated[bool, typer.Option("--force")] = False) -> None:
         typer.confirm(f"Overwrite local index {cfg.db_path}?", abort=True)
 
     async def fn(s: Storage) -> int:
-        return await s.restore_index(_passphrase() if cfg.encrypt else None)
+        return await s.restore_index(_passphrase() if cfg.encrypt else None, require_encrypted=cfg.encrypt)
 
     mid = _run(fn, with_cipher=False)
     console.print(f"restored index from message {mid}")
@@ -609,7 +609,11 @@ def autostart(
 
 
 def main() -> None:
-    app()
+    try:
+        app()
+    except ValueError as e:  # Config.validate(): bad chunk_size / parallel in config.json or env
+        err.print(f"[red]config error:[/red] {e}")
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

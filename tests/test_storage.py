@@ -194,3 +194,61 @@ def test_get_tree_refuses_unsafe_names_from_index(storage, tmp_path):
         storage.index._db.execute("UPDATE nodes SET name = '..' WHERE id = ?", (node.id,))
     with pytest.raises(InvalidOperation):
         run(storage.get_tree("/d", tmp_path / "out"))
+
+
+class SlowBackend(MemoryBackend):
+    """Yields on every call so parallel transfers really interleave; records peak concurrency."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.active = self.peak = 0
+
+    async def _tick(self) -> None:
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        await asyncio.sleep(0.001)
+        self.active -= 1
+
+    async def upload(self, data, filename, caption=""):
+        await self._tick()
+        return await super().upload(data, filename, caption)
+
+    async def download(self, message_id):
+        await self._tick()
+        return await super().download(message_id)
+
+
+@pytest.mark.parametrize("parallel", [1, 3])
+def test_parallel_roundtrip_keeps_chunk_order(index, tmp_path, parallel):
+    backend = SlowBackend()
+    s = Storage(index, backend, chunk_size=CHUNK, parallel=parallel)
+    payload = os.urandom(CHUNK * 7 + 13)
+    run(s.put(write(tmp_path / "a", payload), "/a"))
+    assert [c.idx for c in index.chunks(s.stat("/a").id)] == list(range(8))
+    assert backend.peak == parallel
+    backend.peak = 0
+    assert run(s.get("/a", tmp_path / "out")).read_bytes() == payload
+    assert backend.peak == parallel
+
+
+def test_parallel_failure_rolls_back_in_flight_chunks(index, tmp_path):
+    backend = SlowBackend()
+    backend.fail_after = 4
+    s = Storage(index, backend, chunk_size=CHUNK, parallel=3)
+    with pytest.raises(ConnectionError):
+        run(s.put(write(tmp_path / "a", b"x" * CHUNK * 9), "/a"))
+    assert backend.messages == {}
+    assert index.resolve("/a") is None
+
+
+def test_restore_refuses_plaintext_backup_when_encryption_required(tmp_path, backend):
+    idx = Index(tmp_path / "one.sqlite3")
+    run(Storage(idx, backend, chunk_size=CHUNK).backup_index())
+    with pytest.raises(IntegrityError):
+        run(Storage(idx, backend, chunk_size=CHUNK).restore_index("pw", require_encrypted=True))
+    idx.close()
+
+
+def test_storage_rejects_bad_parallel(index, backend):
+    with pytest.raises(ValueError):
+        Storage(index, backend, chunk_size=CHUNK, parallel=0)

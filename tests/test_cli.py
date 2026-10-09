@@ -137,3 +137,15 @@ def test_kept_ui_token_is_stable(tmp_path):
     assert cli._ui_token(cfg, keep=True) == a
     assert (tmp_path / "ui-token").stat().st_mode & 0o777 == 0o600
     assert cli._ui_token(cfg, keep=False) != a
+
+
+def test_config_validates_parallel_and_chunk_size(tmp_path, monkeypatch):
+    from tgfs.config import Config
+
+    monkeypatch.setenv("TGFS_PARALLEL", "4")
+    assert Config.load(tmp_path).parallel == 4
+    for var, bad in (("TGFS_PARALLEL", "0"), ("TGFS_CHUNK_SIZE", str(4 * 1024**3))):
+        monkeypatch.setenv(var, bad)
+        with pytest.raises(ValueError):
+            Config.load(tmp_path)
+        monkeypatch.delenv(var)

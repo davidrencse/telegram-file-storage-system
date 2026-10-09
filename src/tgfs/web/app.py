@@ -239,12 +239,12 @@ def create_app(
         node = state.s.index.require(request.query_params["path"])
         if node.is_dir:
             raise IsADirectory(request.query_params["path"])
-        chunks = state.s.index.chunks(node.id)
         storage = state.s
 
         async def body() -> AsyncIterator[bytes]:
-            for chunk in chunks:
-                yield await storage.read_chunk(chunk)
+            async with contextlib.aclosing(storage.iter_chunks(node)) as stream:  # prefetches next chunk(s)
+                async for data in stream:
+                    yield data
 
         media, inline = _preview_type(node.name, bool(request.query_params.get("inline")))
         headers = {

@@ -96,12 +96,13 @@ Telegram chat contents:
 
 1. **No orphan blobs.** Index mutators (`put_file`, `remove`, `move`) return orphaned message ids; `Storage`
    must delete them from Telegram. `Storage.put` deletes already-uploaded chunks if anything fails
-   (including `BaseException` / Ctrl-C).
+   (including `BaseException` / Ctrl-C); in-flight parallel uploads are awaited, never cancelled, so their ids are known.
 2. **Validate before upload.** `put` checks the destination parent exists *before* sending bytes.
 3. **Integrity.** `read_chunk` checks plaintext length; `get` checks full-file sha256 and writes to
    `*.tgfs-part` then atomically renames. Never leave partial files at the destination.
 4. **Encryption never downgrades.** If `config.encrypt` is on, any command that uploads the index must have the
    cipher (`_run(..., backup=True)` forces `with_cipher=True`). A plaintext index would leak all file names.
+   `restore` with encryption on refuses a plaintext snapshot (`require_encrypted`).
 5. **Secrets.** `<home>/account.session` = full account takeover if leaked. Kept `0600`, home dir `0700`,
    gitignored. Never log/print api_hash, session contents, or passphrase. Passphrase is never stored.
 6. **Index is authoritative.** Telegram only holds opaque blobs. Losing the index without a backup = losing
@@ -163,7 +164,8 @@ Telegram chat contents:
 
 ## 10. Known limitations / roadmap
 
-- Uploads/downloads are sequential per file (simple, gentle on rate limits). Parallel chunk transfer = speedup.
+- Chunk transfers are pipelined per file: `parallel` chunks in flight (config/`TGFS_PARALLEL`, default 2, max 8);
+  peak memory ≈ (parallel+1) × chunk_size. Files themselves are still transferred one after another.
 - No dedup (same content uploaded twice = two copies). Could key chunks by sha256 with refcounts.
 - FUSE writes buffer the whole file in `<home>/cache` and upload on `close()`; random writes to huge files are costly.
 - No `gc` to find chat messages not referenced by the index (e.g. after a crash between upload and index commit).
@@ -191,6 +193,7 @@ Scouted from the available skill list. Use these; ignore the rest (Vercel/Next.j
 | Commit messages | `caveman:caveman-commit` (Conventional Commits) |
 | Locating code cheaply / small edits / diff review | agents `caveman:cavecrew-investigator`, `caveman:cavecrew-builder`, `caveman:cavecrew-reviewer` |
 | Tech-debt pass | `engineering:tech-debt` |
+| Speed / reliability / security audit of the storage stack | project skill `tgfs-audit` (`.claude/skills/tgfs-audit/SKILL.md`) |
 
 ## 12. Glossary
 

@@ -67,7 +67,7 @@ async def open_storage(
                 raise TgfsError("encryption enabled but no passphrase source")
             first_time = index.get_meta(META_SALT) is None
             cipher = open_cipher(index, passphrase(first_time))
-        yield Storage(index, TelegramBackend(client, cfg.chat), cfg.chunk_size, cipher)
+        yield Storage(index, TelegramBackend(client, cfg.chat), cfg.chunk_size, cipher, cfg.parallel)
     finally:
         if index is not None:
             index.close()
